@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+"""
+Hext CLI - Development and testing tool for Hext Rails app
+
+Commands:
+  up [--platform PLATFORM]  Start Docker containers (Rails + Postgres)
+  down                      Stop Docker containers
+  build [--platform PLATFORM] Rebuild Docker image (run after Dockerfile changes)
+  server                    Start Rails server on http://localhost:3000
+  test [args...]            Run RSpec tests (supports all RSpec options)
+  shell                     Open bash shell in Rails container
+  logs                      Show Rails container logs
+  clean-pry                 Remove all binding.pry statements from spec files
+
+Options:
+  --platform PLATFORM       Build for specific platform (arm64, amd64, x86)
+                           Default: auto-detect (arm64 on Apple Silicon, amd64 otherwise)
+
+Examples:
+  hext up                  # Auto-detect platform
+  hext up --platform amd64 # Force x86_64 (for Windows/Linux teammates)
+  hext build --platform arm64 # Force ARM (for Apple Silicon)
+
+  # Testing examples
+  hext test                                     # Run all tests
+  hext test spec/models                         # Run directory
+  hext test spec/models/user_spec.rb            # Run file
+  hext test spec/models/user_spec.rb:42         # Run specific line
+  hext test spec/models/user_spec.rb:42:56      # Run multiple lines
+  hext test --example "increments counter"      # Run by example name
+  hext test -e "auto-confirms"                  # Run by example (short)
+  hext test spec/models --tag focus             # Run directory with tag
+  hext test prev                                # Re-run previously failed tests
+  hext test failed                              # Re-run previously failed tests (alias)
+  hext test --debug spec/models/user_spec.rb:42 # Debug mode (enables binding.pry)
+  hext test -d spec/models                      # Debug mode (short form)
+
+  # Cleanup
+  hext clean-pry           # Remove all binding.pry from spec files
+"""
+
+import subprocess
+import sys
+import os
+import platform
+import re
+import json
+
+CONTAINER_NAME = "hext_rails"
+COMPOSE_FILE = os.path.join(os.path.dirname(__file__), "docker-compose.yml")
+CACHE_FILE = os.path.join(os.path.dirname(__file__), ".hext_test_cache.json")
+
+# Platform mapping
+PLATFORM_MAP = {
+    'arm64': 'linux/arm64',
+    'amd64': 'linux/amd64',
+    'x86': 'linux/amd64',
+    'x86_64': 'linux/amd64',
+}
+
+
+def run_command(cmd, check=True, capture_output=False):
+    """Run a shell command"""
+    if capture_output:
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    else:
+        return subprocess.run(cmd, shell=True, check=check)
+
+
+def parse_failed_tests(output):
+    """Parse RSpec output to extract failed test locations
+
+    RSpec outputs failures like:
+      rspec ./spec/models/user_spec.rb:42 # User validations should validate email
+    """
+    failed_tests = []
+
+    # Pattern matches lines like: rspec ./spec/path/file_spec.rb:123
+    pattern = r'rspec\s+(\.\/)?([^\s]+\.rb:\d+)'
+
+    for line in output.split('\n'):
+        match = re.search(pattern, line)
+        if match:
+            # Extract just the file path with line number
+            test_location = match.group(2)
+            if test_location not in failed_tests:
+                failed_tests.append(test_location)
+
+    return failed_tests
+
+
+def save_test_cache(failed_tests, last_command):
+    """Save failed tests to cache file"""
+    cache_data = {
+        'failed_tests': failed_tests,
+        'last_command': last_command
+    }
+
+    try:
+        with open(CACHE_FILE, 'w') as f:
+            json.dump(cache_data, f, indent=2)
+    except Exception:
+        # Silently fail if cache can't be written
+        pass
+
+
+def load_test_cache():
+    """Load failed tests from cache file"""
+    try:
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE, 'r') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return None
+
+
+def check_container_running():
+    """Check if Rails container is running"""
+    result = run_command(
+        f"docker ps --filter name={CONTAINER_NAME} --format '{{{{.Names}}}}'",
+        capture_output=True
+    )
+    return CONTAINER_NAME in result.stdout
+
+
+def detect_platform():
+    """Auto-detect platform based on host architecture"""
+    machine = platform.machine().lower()
+    if machine in ['arm64', 'aarch64']:
+        return 'linux/arm64'
+    else:
+        return 'linux/amd64'
+
+
+def parse_platform_arg(args):
+    """Parse --platform flag from args"""
+    platform_arg = None
+    remaining_args = []
+
+    i = 0
+    while i < len(args):
+        if args[i] == '--platform' and i + 1 < len(args):
+            platform_key = args[i + 1].lower()
+            platform_arg = PLATFORM_MAP.get(platform_key, platform_key)
+            if not platform_arg.startswith('linux/'):
+                platform_arg = f'linux/{platform_arg}'
+            i += 2
+        else:
+            remaining_args.append(args[i])
+            i += 1
+
+    return platform_arg or detect_platform(), remaining_args
+
+
+def is_windows():
+    """Check if running on Windows"""
+    return sys.platform.startswith('win')
+
+
+def run_docker_compose(cmd, platform):
+    """Run docker-compose with platform environment variable"""
+    if is_windows():
+        # Windows: Use subprocess env parameter
+        env = os.environ.copy()
+        env['DOCKER_DEFAULT_PLATFORM'] = platform
+        return subprocess.run(cmd, shell=True, env=env, check=True)
+    else:
+        # Unix (Mac/Linux): Use shell env var syntax
+        env_cmd = f"DOCKER_DEFAULT_PLATFORM={platform} {cmd}"
+        return run_command(env_cmd)
+
+
+def build(platform=None):
+    """Rebuild Docker image"""
+    if platform is None:
+        platform = detect_platform()
+
+    print(f"🔨 Building Hext Docker image for {platform}...")
+    run_docker_compose(f"docker compose -f {COMPOSE_FILE} build", platform)
+    print("✅ Build complete!")
+
+
+def up(platform=None):
+    """Start containers"""
+    if platform is None:
+        platform = detect_platform()
+
+    print(f"🚀 Starting Hext containers for {platform}...")
+    run_docker_compose(f"docker compose -f {COMPOSE_FILE} up -d --build", platform)
+    print("✅ Containers started!")
+    print("📦 Installing dependencies (this may take a moment on first run)...")
+    print("\n💡 Tip: Run 'hext test' to run tests or 'hext shell' for interactive shell")
+
+
+def down():
+    """Stop containers"""
+    print("🛑 Stopping Hext containers...")
+    run_command(f"docker compose -f {COMPOSE_FILE} down")
+    print("✅ Containers stopped!")
+
+
+def test(args):
+    """Run RSpec tests
+
+    Examples:
+        hext test                                    # Run all tests
+        hext test spec/models                        # Run directory
+        hext test spec/models/user_spec.rb           # Run file
+        hext test spec/models/user_spec.rb:42        # Run specific line
+        hext test spec/models/user_spec.rb:42:56     # Run multiple lines
+        hext test --example "increments counter"     # Run by name
+        hext test -e "auto-confirms"                 # Run by name (short)
+        hext test --tag focus                        # Run by tag
+        hext test prev                               # Re-run previously failed tests
+        hext test failed                             # Re-run previously failed tests
+        hext test --debug [args]                     # Debug mode (enables binding.pry)
+        hext test -d [args]                          # Debug mode (short form)
+    """
+    if not check_container_running():
+        print("❌ Rails container is not running. Start it with: hext up")
+        sys.exit(1)
+
+    # Check for debug mode
+    debug_mode = False
+    if args and args[0] in ['--debug', '-d']:
+        debug_mode = True
+        args = args[1:]  # Remove debug flag from args
+
+    # Check if user wants to re-run previous failures
+    if args and args[0] in ['prev', 'failed']:
+        cache = load_test_cache()
+        if not cache or not cache.get('failed_tests'):
+            print("❌ No previously failed tests found. Run tests first to build cache.")
+            sys.exit(1)
+
+        failed_tests = cache['failed_tests']
+        print(f"🔄 Re-running {len(failed_tests)} previously failed test(s):")
+        for test in failed_tests:
+            print(f"   - {test}")
+        print()
+
+        rspec_args = ' '.join(failed_tests)
+        test_cmd = f"bundle exec rspec {rspec_args}"
+    else:
+        # Join all arguments to pass through to RSpec
+        # This allows line numbers, directories, options, etc.
+        if args:
+            rspec_args = ' '.join(args)
+            test_cmd = f"bundle exec rspec {rspec_args}"
+        else:
+            test_cmd = "bundle exec rspec"
+
+    if debug_mode:
+        print(f"🐛 Running tests in DEBUG mode (binding.pry enabled): {test_cmd}")
+    else:
+        print(f"🧪 Running tests: {test_cmd}")
+
+    # Ensure test database exists
+    run_command(
+        f"docker exec {CONTAINER_NAME} bash -c 'RAILS_ENV=test bundle exec rails db:create db:migrate'",
+        check=False
+    )
+
+    # Run tests
+    if debug_mode:
+        # Interactive mode for debugging (allows binding.pry to work)
+        # Use os.system() instead of subprocess.run() to properly connect stdin
+        exit_code = os.system(
+            f"docker exec -it -e RAILS_ENV=test {CONTAINER_NAME} {test_cmd}"
+        )
+        # Don't parse failures in debug mode
+        # os.system returns exit code shifted by 8 bits on Unix
+        sys.exit(exit_code >> 8 if exit_code > 0 else 0)
+    else:
+        # Normal mode with output capture for failure parsing
+        result = subprocess.run(
+            f"docker exec -e RAILS_ENV=test {CONTAINER_NAME} {test_cmd}",
+            shell=True,
+            capture_output=True,
+            text=True
+        )
+
+        # Print output
+        print(result.stdout)
+        if result.stderr:
+            print(result.stderr, file=sys.stderr)
+
+        # Parse failed tests and save to cache
+        failed_tests = parse_failed_tests(result.stdout + result.stderr)
+
+        if failed_tests:
+            save_test_cache(failed_tests, test_cmd)
+            print(f"\n💾 Cached {len(failed_tests)} failed test(s). Run 'hext test prev' to re-run them.")
+        else:
+            # Clear cache if all tests passed
+            if os.path.exists(CACHE_FILE):
+                os.remove(CACHE_FILE)
+
+        sys.exit(result.returncode)
+
+
+def shell():
+    """Open interactive shell"""
+    if not check_container_running():
+        print("❌ Rails container is not running. Start it with: hext up")
+        sys.exit(1)
+
+    print("🐚 Opening shell in Rails container...")
+    run_command(f"docker exec -it {CONTAINER_NAME} bash")
+
+
+def logs():
+    """Show container logs"""
+    print("📋 Showing Rails container logs...")
+    run_command(f"docker compose -f {COMPOSE_FILE} logs -f rails")
+
+
+def server():
+    """Start Rails server"""
+    if not check_container_running():
+        print("❌ Rails container is not running. Start it with: hext up")
+        sys.exit(1)
+
+    print("🌐 Starting Rails server on http://localhost:3000")
+    print("💡 Press Ctrl+C to stop the server\n")
+    run_command(f"docker exec -it {CONTAINER_NAME} rails server -b 0.0.0.0")
+
+
+def clean_pry():
+    """Remove all binding.pry statements from spec files"""
+    # Get the hext project directory (parent of hext_infra)
+    infra_dir = os.path.dirname(os.path.abspath(__file__))
+    project_dir = os.path.join(os.path.dirname(infra_dir), 'hext')
+    spec_dir = os.path.join(project_dir, 'spec')
+
+    if not os.path.exists(spec_dir):
+        print(f"❌ Spec directory not found at {spec_dir}")
+        sys.exit(1)
+
+    print("🧹 Removing binding.pry statements from spec files...")
+
+    # Find all .rb files in spec directory
+    count = 0
+    for root, dirs, files in os.walk(spec_dir):
+        for file in files:
+            if file.endswith('.rb'):
+                file_path = os.path.join(root, file)
+
+                # Read file content
+                with open(file_path, 'r') as f:
+                    lines = f.readlines()
+
+                # Filter out lines containing binding.pry
+                new_lines = []
+                removed = 0
+                for line in lines:
+                    if 'binding.pry' in line:
+                        removed += 1
+                    else:
+                        new_lines.append(line)
+
+                # Write back if changes were made
+                if removed > 0:
+                    with open(file_path, 'w') as f:
+                        f.writelines(new_lines)
+                    rel_path = os.path.relpath(file_path, project_dir)
+                    print(f"   ✓ {rel_path} ({removed} line(s) removed)")
+                    count += removed
+
+    if count > 0:
+        print(f"\n✅ Removed {count} binding.pry statement(s) from spec files")
+    else:
+        print("\n✅ No binding.pry statements found in spec files")
+
+
+def usage():
+    """Show usage information"""
+    print(__doc__)
+    sys.exit(1)
+
+
+def main():
+    if len(sys.argv) < 2:
+        usage()
+
+    command = sys.argv[1]
+    args = sys.argv[2:] if len(sys.argv) > 2 else []
+
+    # Parse platform for build/up commands
+    if command in ['up', 'build']:
+        platform, args = parse_platform_arg(args)
+        commands = {
+            "up": lambda: up(platform),
+            "down": lambda: down(),
+            "build": lambda: build(platform),
+            "server": lambda: server(),
+            "test": lambda: test(args),
+            "shell": lambda: shell(),
+            "logs": lambda: logs(),
+            "clean-pry": lambda: clean_pry(),
+        }
+    else:
+        commands = {
+            "up": lambda: up(),
+            "down": lambda: down(),
+            "build": lambda: build(),
+            "server": lambda: server(),
+            "test": lambda: test(args),
+            "shell": lambda: shell(),
+            "logs": lambda: logs(),
+            "clean-pry": lambda: clean_pry(),
+        }
+
+    if command not in commands:
+        print(f"❌ Unknown command: {command}\n")
+        usage()
+
+    try:
+        commands[command]()
+    except KeyboardInterrupt:
+        print("\n\n👋 Interrupted by user")
+        sys.exit(130)
+    except subprocess.CalledProcessError as e:
+        print(f"\n❌ Command failed with exit code {e.returncode}")
+        sys.exit(e.returncode)
+
+
+if __name__ == "__main__":
+    main()
