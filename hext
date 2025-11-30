@@ -258,7 +258,7 @@ def test(args):
 
     # Ensure test database exists
     run_command(
-        f"docker exec {CONTAINER_NAME} bash -c 'RAILS_ENV=test bundle exec rails db:create db:migrate'",
+        f"docker exec -e RAILS_ENV=test {CONTAINER_NAME} bundle exec rails db:create db:migrate",
         check=False
     )
 
