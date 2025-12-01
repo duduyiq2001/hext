@@ -1,0 +1,57 @@
+{{- if .Values.migrationJob.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "e-ren.fullname" . }}-migrate-{{ .Values.migrationJob.revision | default "v1" }}
+  labels:
+    {{- include "e-ren.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migration
+spec:
+  ttlSecondsAfterFinished: {{ .Values.migrationJob.ttlSecondsAfterFinished | default 600 }}
+  backoffLimit: {{ .Values.migrationJob.backoffLimit | default 2 }}
+  template:
+    metadata:
+      labels:
+        {{- include "e-ren.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: migration
+    spec:
+      serviceAccountName: {{ include "e-ren.serviceAccountName" . }}
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              echo "=== Running Database Migrations ==="
+              echo "Started at: $(date)"
+              echo ""
+
+              bundle exec rails db:migrate
+
+              echo ""
+              echo "=== Migrations Complete ==="
+              echo "Finished at: $(date)"
+          env:
+            - name: RAILS_ENV
+              value: "production"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.databaseUrl.secretName }}
+                  key: {{ .Values.secrets.databaseUrl.key }}
+            - name: SECRET_KEY_BASE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.secretKeyBase.secretName }}
+                  key: {{ .Values.secrets.secretKeyBase.key }}
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+{{- end }}

@@ -1,0 +1,91 @@
+{{- if .Values.setupJob.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "e-ren.fullname" . }}-setup
+  labels:
+    {{- include "e-ren.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        {{- include "e-ren.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: setup
+    spec:
+      serviceAccountName: {{ include "e-ren.serviceAccountName" . }}
+      restartPolicy: Never
+      containers:
+        - name: setup
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              echo "=== E-Ren Production Setup ==="
+              echo ""
+
+              # Run migrations
+              echo "Running database migrations..."
+              bundle exec rails db:migrate
+              echo "Migrations complete!"
+              echo ""
+
+              # Seed categories
+              echo "Creating default event categories..."
+              bundle exec rails runner "
+                categories = [
+                  'Sports & Recreation',
+                  'Social & Networking',
+                  'Academic & Career',
+                  'Food & Dining',
+                  'Arts & Culture',
+                  'Gaming & Esports'
+                ]
+                categories.each do |name|
+                  EventCategory.find_or_create_by!(name: name)
+                  puts \"  Created: #{name}\"
+                end
+              "
+              echo ""
+
+              # Create admin user
+              echo "Creating admin user..."
+              bundle exec rails runner "
+                admin = User.find_or_initialize_by(email: '{{ .Values.setupJob.adminEmail }}')
+                admin.name = 'Admin'
+                admin.password = '{{ .Values.setupJob.adminPassword }}'
+                admin.password_confirmation = '{{ .Values.setupJob.adminPassword }}'
+                admin.role = :super_admin
+                admin.confirmed_at = Time.current
+                admin.save!
+                puts \"Admin user created: {{ .Values.setupJob.adminEmail }}\"
+              "
+              echo ""
+              echo "=== Setup Complete ==="
+          env:
+            - name: RAILS_ENV
+              value: "production"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.databaseUrl.secretName }}
+                  key: {{ .Values.secrets.databaseUrl.key }}
+            - name: SECRET_KEY_BASE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.secretKeyBase.secretName }}
+                  key: {{ .Values.secrets.secretKeyBase.key }}
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+{{- end }}

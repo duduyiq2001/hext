@@ -1,0 +1,187 @@
+# E-Ren Helm Chart Values
+# Rails app + Datadog monitoring
+
+replicaCount: 2
+
+image:
+  repository: "duyiqun/eren"
+  pullPolicy: Always
+  tag: "latest"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: "e-ren"
+
+# Service Account with IRSA for RDS access
+serviceAccount:
+  create: true
+  automount: true
+  annotations:
+    eks.amazonaws.com/role-arn: ""  # Set via --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=<ARN>
+  name: "e-ren-app"
+
+podAnnotations:
+  ad.datadoghq.com/e-ren.logs: '[{"source":"rails","service":"e-ren"}]'
+  admission.datadoghq.com/ruby-lib.version: "v2.22.0"
+
+podLabels:
+  app: e-ren
+  tags.datadoghq.com/env: "prod"
+  tags.datadoghq.com/service: "e-ren"
+  tags.datadoghq.com/version: "latest"
+  admission.datadoghq.com/enabled: "true"
+
+# Deployment-level labels for Datadog unified service tagging
+deploymentLabels:
+  tags.datadoghq.com/env: "prod"
+  tags.datadoghq.com/service: "e-ren"
+  tags.datadoghq.com/version: "latest"
+
+podSecurityContext: {}
+
+securityContext: {}
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 3000
+
+# ALB Ingress for AWS Load Balancer Controller
+ingress:
+  enabled: true
+  className: "alb"
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:us-east-1:043924444702:certificate/88ce3130-e71a-48c9-859b-180834bbc6de"
+    alb.ingress.kubernetes.io/ssl-redirect: '443'
+    alb.ingress.kubernetes.io/healthcheck-path: '/up'
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: '30'
+  hosts:
+    - host: www.erenspace.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+httpRoute:
+  enabled: false
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 250m
+    memory: 256Mi
+
+livenessProbe:
+  httpGet:
+    path: /up
+    port: 3000
+  initialDelaySeconds: 30
+  periodSeconds: 60
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /up
+    port: 3000
+  initialDelaySeconds: 5
+  periodSeconds: 30
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 80
+
+volumes: []
+volumeMounts: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Setup job - runs migrations, creates categories, admin user
+# Enable with: --set setupJob.enabled=true --set setupJob.adminEmail=... --set setupJob.adminPassword=...
+setupJob:
+  enabled: false
+  adminEmail: "admin@wustl.edu"
+  adminPassword: ""  # REQUIRED - set via --set setupJob.adminPassword=...
+
+# Migration job - runs db:migrate only (no seeds/admin setup)
+# Enable with: --set migrationJob.enabled=true --set migrationJob.revision=v2
+migrationJob:
+  enabled: false
+  revision: "v1"  # Change this each time to create a new job (e.g., v2, v3, add-index-123)
+  ttlSecondsAfterFinished: 600  # Auto-delete job after 10 minutes
+  backoffLimit: 2
+
+# Rails environment variables
+env:
+  RAILS_ENV: "production"
+  RAILS_LOG_TO_STDOUT: "true"
+  RAILS_SERVE_STATIC_FILES: "true"
+  # DATABASE_URL set via secret
+
+# Secrets (reference existing K8s secrets created by create-secrets.sh)
+secrets:
+  databaseUrl:
+    secretName: "e-ren-secrets"
+    key: "DATABASE_URL"
+  secretKeyBase:
+    secretName: "e-ren-secrets"
+    key: "SECRET_KEY_BASE"
+  sendgrid:
+    secretName: "e-ren-secrets"
+    key: "SENDGRID"
+
+# ═══════════════════════════════════════════════════════════
+#   Datadog Official Chart Configuration
+#   https://github.com/DataDog/helm-charts/tree/main/charts/datadog
+# ═══════════════════════════════════════════════════════════
+
+datadog:
+  enabled: true
+
+  # API key from secret created by create-secrets.sh
+  datadog:
+    apiKeyExistingSecret: "datadog-secret"
+    site: "us5.datadoghq.com"
+    clusterName: "e-ren-cluster"
+
+    # APM tracing
+    apm:
+      portEnabled: true
+      socketEnabled: true
+
+    # Log collection
+    logs:
+      enabled: true
+      containerCollectAll: true
+
+    # Process monitoring
+    processAgent:
+      enabled: true
+      processCollection: true
+
+    # Dogstatsd for custom metrics
+    dogstatsd:
+      useHostPort: true
+
+  # Agent resource limits
+  agents:
+    containers:
+      agent:
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 200m
+            memory: 512Mi

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Hext CLI - Development and testing tool for Hext Rails app
+Hext CLI - Development, testing, and deployment tool for E-Ren Rails app
 
 Commands:
   up [--platform PLATFORM]  Start Docker containers (Rails + Postgres)
   down                      Stop Docker containers
   build [--platform PLATFORM] Rebuild Docker image (run after Dockerfile changes)
+  push                      Build production image and push to Docker Hub
+  deploy [--migrate [rev]]  Deploy to EKS using Helm (optionally with migrations)
   server                    Start Rails server on http://localhost:3000
   test [args...]            Run RSpec tests (supports all RSpec options)
   shell                     Open bash shell in Rails container
@@ -34,6 +36,12 @@ Examples:
   hext test failed                              # Re-run previously failed tests (alias)
   hext test --debug spec/models/user_spec.rb:42 # Debug mode (enables binding.pry)
   hext test -d spec/models                      # Debug mode (short form)
+
+  # Deployment examples
+  hext push                # Build and push production image
+  hext deploy              # Deploy to EKS (no migrations)
+  hext deploy --migrate    # Deploy with migration job
+  hext deploy --migrate v2 # Deploy with migration job (revision v2)
 
   # Cleanup
   hext clean-pry           # Remove all binding.pry from spec files
@@ -327,6 +335,62 @@ def server():
     run_command(f"docker exec -it {CONTAINER_NAME} rails server -b 0.0.0.0")
 
 
+def push():
+    """Build production image and push to Docker Hub"""
+    hext_dir = os.path.dirname(os.path.abspath(__file__))
+    project_dir = os.path.join(os.path.dirname(hext_dir), 'e_ren')
+    image_name = "duyiqun/eren:latest"
+
+    print(f"🔨 Building production image for linux/arm64...")
+    run_command(f"docker build --platform linux/arm64 -t {image_name} {project_dir}")
+
+    print(f"🚀 Pushing {image_name} to Docker Hub...")
+    run_command(f"docker push {image_name}")
+
+    print(f"✅ Successfully pushed {image_name}")
+
+
+def deploy(args):
+    """Deploy to EKS using Helm
+
+    Examples:
+        hext deploy                    # Deploy without migrations
+        hext deploy --migrate          # Deploy with migration job
+        hext deploy --migrate v2       # Deploy with migration job (revision v2)
+    """
+    hext_dir = os.path.dirname(os.path.abspath(__file__))
+    helm_chart = os.path.join(hext_dir, "helm-charts", "e-ren")
+
+    if not os.path.exists(helm_chart):
+        print(f"❌ Helm chart not found at {helm_chart}")
+        sys.exit(1)
+
+    # Check for --migrate flag
+    migrate = False
+    revision = "v1"
+    if args and args[0] == '--migrate':
+        migrate = True
+        if len(args) > 1:
+            revision = args[1]
+
+    # Build helm command
+    helm_cmd = f"helm upgrade --install e-ren {helm_chart}"
+
+    if migrate:
+        helm_cmd += f" --set migrationJob.enabled=true --set migrationJob.revision={revision}"
+        print(f"🚀 Deploying e-ren with migrations (revision: {revision})...")
+    else:
+        print("🚀 Deploying e-ren...")
+
+    run_command(helm_cmd)
+
+    print("✅ Deployment complete!")
+
+    # Show rollout status
+    print("\n📊 Checking rollout status...")
+    run_command("kubectl rollout status deployment/e-ren", check=False)
+
+
 def clean_pry():
     """Remove all binding.pry statements from spec files"""
     # Get the hext project directory (parent of hext_infra)
@@ -399,6 +463,8 @@ def main():
             "shell": lambda: shell(),
             "logs": lambda: logs(),
             "clean-pry": lambda: clean_pry(),
+            "push": lambda: push(),
+            "deploy": lambda: deploy(args),
         }
     else:
         commands = {
@@ -410,6 +476,8 @@ def main():
             "shell": lambda: shell(),
             "logs": lambda: logs(),
             "clean-pry": lambda: clean_pry(),
+            "push": lambda: push(),
+            "deploy": lambda: deploy(args),
         }
 
     if command not in commands:
